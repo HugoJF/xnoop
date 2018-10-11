@@ -619,10 +619,18 @@ bool is_filtered() {
     return stack[0] == 0;
 }
 
-char *ether_addr_to_string(unsigned int *addr) {
+char *ether_addr_to_string(unsigned char *addr) {
     char *str = malloc(sizeof(char) * 17);
 
-    sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    // TODO: check ntohs
+    sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+            (addr[0]),
+            (addr[1]),
+            (addr[2]),
+            (addr[3]),
+            (addr[4]),
+            (addr[5])
+    );
 
     return str;
 }
@@ -638,7 +646,7 @@ char *get_ether_type_name(unsigned int type) {
         case ETH_P_IPV6:
             return "IPv6";
         default:
-            return "Unknown Ethernet frame type";
+            return "Unknown";
     }
 }
 
@@ -651,10 +659,10 @@ void print_ether_hdr(ether_hdr *hdr, int data_size) {
     int order = packet_count;
     int size = data_size;
     int type_number = hdr->ether_type;
-    char *type_name = get_ether_type_name(hdr->ether_type);
-    char *dst_addr = ether_addr_to_string((unsigned int *) hdr->ether_dhost);
-    char *src_addr = ether_addr_to_string((unsigned int *) hdr->ether_shost);
-    char *make = get_make_from_ether_addr((unsigned int *) hdr->ether_shost);
+    char *type_name = get_ether_type_name(ntohs(hdr->ether_type));
+    char *dst_addr = ether_addr_to_string(hdr->ether_dhost);
+    char *src_addr = ether_addr_to_string(hdr->ether_shost);
+    char *make = get_make_from_ether_addr(hdr->ether_shost);
 
     printf("ETHER:  ----- Ethernet Header -----\n"
            "ETHER:\n"
@@ -670,6 +678,8 @@ void print_ether_hdr(ether_hdr *hdr, int data_size) {
             /* Source      */ src_addr, make,
             /* Ethertype   */ type_number, type_name
     );
+
+    extra
 }
 
 // Break this function to implement the functionalities of your packet analyser
@@ -717,7 +727,7 @@ int main(int argc, char **argv) {
     process_parameters(argc, argv);
 
     // Building socket
-    if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL)) < 0)) {
+    if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) < 0) {
         perror("Building socket");
         exit(errno);
     }
@@ -738,10 +748,11 @@ int main(int argc, char **argv) {
     // Read `max_packets` packets
     while (packet_count++ < max_packets) {
 
-        if ((n = recv(sockfd, packet_buffer, MAX_PACKET_SIZE, 0) < 0)) {
+        if ((n = recv(sockfd, packet_buffer, MAX_PACKET_SIZE, 0)) < 0) {
             perror("Reading packet");
             exit(errno);
         }
+        printf(".");
         process(packet_buffer, n);
     }
 

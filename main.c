@@ -635,6 +635,20 @@ char *ether_addr_to_string(unsigned char *addr) {
     return str;
 }
 
+char *ip_addr_to_string(unsigned int ip) {
+    int parts[4];
+    int mask = 0xFF;
+    for (int i = 0; i < 4; ++i) {
+        parts[i] = ip & (mask << (3 - i));
+    }
+
+    char* str_ip = malloc(sizeof(char) * 15);
+
+    sprintf(str_ip, "%000d.%000d.%000d.%000d", parts[0], parts[1], parts[2], parts[3]);
+
+    return str_ip;
+}
+
 char *get_ether_type_name(unsigned int type) {
     switch (type) {
         case ETH_P_ARP:
@@ -679,7 +693,35 @@ void print_ether_hdr(ether_hdr *hdr, int data_size) {
             /* Ethertype   */ type_number, type_name
     );
 
-    extra
+    // check if data is ip
+}
+
+void print_ip_hdr(ip_hdr *hdr, int data_size) {
+    printf("IP: ----- IP Header -----\n"
+    "IP:\n"
+    "IP: Version = 4, header length = %d bytes\n"
+    "IP: Type of service = xx\n"
+    "IP: ..0. .... = routine\n"
+    "IP: ...0 .... = normal delay\n"
+    "IP: .... 0... = normal throughput\n"
+    "IP: .... .0.. = normal reliability\n"
+    "IP: Total length = xxx bytes\n"
+    "IP: Identification x\n"
+    "IP: Flags = 0X\n"
+    "IP: .0.. .... = may fragment\n"
+    "IP: ..0. .... = more fragments\n"
+    "IP: Fragment offset = 0 bytes\n"
+    "IP: Time to live = xxx seconds/hops\n"
+    "IP: Protocol = xx (XXX)\n"
+    "IP: Header checksum = xxxx\n"
+    "IP: Source address = %s,\n"
+    "IP: Destination address = %s,\n"
+    "IP:\n"
+    ,
+    data_size,
+    ip_addr_to_string(hdr->ip_src),
+    ip_addr_to_string(hdr->ip_dst)
+    );
 }
 
 // Break this function to implement the functionalities of your packet analyser

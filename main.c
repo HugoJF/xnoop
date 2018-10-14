@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <ctype.h>
+#include <signal.h>
 
 /***********************
  * STATIC DECLARATIONS *
@@ -40,7 +41,8 @@ typedef struct _ip_hdr {
     unsigned char ip_tos;        // Type of service
     unsigned short ip_len;        // Datagram Length
     unsigned short ip_id;        // Datagram identifier
-    unsigned short ip_offset;    // Fragment offset
+    unsigned short ip_flags:3;
+    unsigned short ip_offset:13;    // Fragment offset
     unsigned char ip_ttl;        // Time To Live
     unsigned char ip_proto;    // Protocol
     unsigned short ip_csum;    // Header checksum
@@ -55,9 +57,9 @@ typedef struct _arp_hdr {
     unsigned char plen;
     unsigned short opcode;
     unsigned char sender_mac[6];
-    unsigned char sender_ip[4];
+    unsigned int sender_ip;
     unsigned char dest_mac[6];
-    unsigned char dest_ip[4];
+    unsigned int dest_ip;
 } arp_hdr;
 
 typedef struct _udp_hdr {
@@ -110,6 +112,12 @@ bool verbose_extended = false;
 // Read packet count
 int packet_count = 0;
 
+// Accept packets
+int accepted_packets = 0;
+
+// How many packets were rejected in a row
+int sequential_rejected_packets= 0;
+
 // Filter stack
 unsigned long *stack;
 
@@ -121,12 +129,179 @@ char **filters;
 
 // Current headers to be filtered
 ether_hdr *current_ether_hdr = NULL;
-ip_hdr *current_ip_hdr = NULL;
-arp_hdr *current_arp_hdr = NULL;
+long current_ether_hdr_len = 0;
+
+// Caches to avoid helper functions re-calculating stuff
+unsigned char *current_network_data = NULL;  // ARP/IP
+unsigned char *current_transport_data = NULL; // TCP/UDP
+
+
+/**************************
+ * HEADER DATA EXTRACTORS *
+ **************************/
+
+
+unsigned char *extract_data_from_hdr(unsigned char *hdr, unsigned int hdr_size, long data_len, unsigned int hdr_tail) {
+    unsigned int udp_data_len = ((unsigned int) data_len) - hdr_size - hdr_tail;
+    unsigned char *udp_data = malloc(sizeof(unsigned char) * (udp_data_len - hdr_tail));
+
+    memcpy(udp_data, hdr + hdr_size, udp_data_len);
+
+    return udp_data;
+}
+
+unsigned char *extract_data_from_eth_hdr(unsigned char *hdr, long data_len) {
+    return extract_data_from_hdr(hdr, sizeof(ether_hdr), data_len, 0);
+}
+
+unsigned char *extract_data_from_arp_hdr(unsigned char *hdr, long data_len) {
+    return extract_data_from_hdr(hdr, sizeof(arp_hdr), data_len, 0);
+}
+
+unsigned char *extract_data_from_ip_hdr(unsigned char *hdr, long data_len) {
+    return extract_data_from_hdr(hdr, sizeof(ip_hdr), data_len, 0);
+}
+
+unsigned char *extract_data_from_tcp_hdr(unsigned char *hdr, long data_len) {
+    return extract_data_from_hdr(hdr, sizeof(tcp_hdr), data_len, 0);
+}
+
+unsigned char *extract_data_from_udp_hdr(unsigned char *hdr, long data_len) {
+    return extract_data_from_hdr(hdr, sizeof(udp_hdr), data_len, 0);
+}
+
+unsigned char *extract_data_from_icmp_hdr(unsigned char *hdr, long data_len) {
+    return extract_data_from_hdr(hdr, sizeof(icmp_hdr), data_len, 0);
+}
+
+
+/*********************
+ * ETHER HEADER DATA *
+ *********************/
+
+
+bool eth_hdr_data_is(ether_hdr *hdr, unsigned short type) {
+    return hdr->ether_type == htons(type);
+}
+
+bool eth_hdr_data_is_ip(ether_hdr *hdr) {
+    return eth_hdr_data_is(hdr, ETH_P_IP);
+}
+
+bool eth_hdr_data_is_arp(ether_hdr *hdr) {
+    return eth_hdr_data_is(hdr, ETH_P_ARP);
+}
+
+
+/******************
+ * IP HEADER DATA *
+ ******************/
+
+
+bool ip_hdr_data_is(ip_hdr *hdr, unsigned short proto) {
+    return hdr->ip_proto == proto;
+}
+
+bool ip_hdr_data_is_tcp(ip_hdr *hdr) {
+    return ip_hdr_data_is(hdr, IPPROTO_TCP);
+}
+
+bool ip_hdr_data_is_udp(ip_hdr *hdr) {
+    return ip_hdr_data_is(hdr, IPPROTO_UDP);
+}
+
+bool ip_hdr_data_is_icmp(ip_hdr *hdr) {
+    return ip_hdr_data_is(hdr, IPPROTO_ICMP);
+}
+
+
+/***********
+ * HELPERS *
+ ***********/
+
+
+
+ether_hdr *get_current_ether_hdr() {
+    return current_ether_hdr;
+}
+
+arp_hdr *get_current_arp_hdr() {
+    unsigned char *h = get_current_ether_hdr();
+    if (eth_hdr_data_is_arp((ether_hdr *) h)) {
+        return (arp_hdr *) extract_data_from_eth_hdr(h, current_ether_hdr_len);
+    } else {
+        return NULL;
+    }
+}
+
+ip_hdr *get_current_ip_hdr() {
+    ether_hdr *h = get_current_ether_hdr();
+
+    // If Ethernet header is not IP ignore
+    if (eth_hdr_data_is_arp(h)) {
+        return NULL;
+    }
+
+    // Check if extraction is needed
+    if(current_network_data == NULL) {
+        current_network_data = extract_data_from_eth_hdr((unsigned char *) h, current_ether_hdr_len);
+    }
+
+    return (ip_hdr*) current_network_data;
+}
+
+tcp_hdr *get_current_tcp_hdr() {
+    ip_hdr *h = get_current_ip_hdr();
+
+    // If Ethernet header is not ARP ignore
+    if (ip_hdr_data_is_tcp(h)) {
+        return NULL;
+    }
+
+    // Check if extraction is needed
+    if(current_network_data == NULL) {
+        current_network_data = extract_data_from_eth_hdr((unsigned char *) h, current_ether_hdr_len);
+    }
+
+    return (tcp_hdr*) current_network_data;
+}
+
+udp_hdr *get_current_udp_hdr() {
+    ip_hdr *h = get_current_ip_hdr();
+
+    // If Ethernet header is not ARP ignore
+    if (ip_hdr_data_is_udp(h)) {
+        return NULL;
+    }
+
+    // Check if extraction is needed
+    if(current_network_data == NULL) {
+        current_network_data = extract_data_from_eth_hdr((unsigned char *) h, current_ether_hdr_len);
+    }
+
+    return (udp_hdr*) current_network_data;
+}
+
+icmp_hdr *get_current_icmp_hdr() {
+    ip_hdr *h = get_current_ip_hdr();
+
+    // If Ethernet header is not ARP ignore
+    if (ip_hdr_data_is_icmp(h)) {
+        return NULL;
+    }
+
+    // Check if extraction is needed
+    if(current_network_data == NULL) {
+        current_network_data = extract_data_from_eth_hdr((unsigned char *) h, current_ether_hdr_len);
+    }
+
+    return (icmp_hdr*) current_network_data;
+}
 
 /***********
  * FILTERS *
  ***********/
+
 
 void run_mod_filter() {
     stack[stackTop - 2] = (stack[stackTop - 2] % stack[stackTop - 1]);
@@ -157,40 +332,51 @@ void run_plus_filter() {
     stackTop--;
 }
 
-void run_not_filter() { stack[stackTop - 1] = (stack[stackTop - 1] != 0); }
+void run_not_filter() { stack[stackTop - 1] = (unsigned long) (stack[stackTop - 1] != 0); }
 
 void run_eq_filter() {
 //    printf("%lu == %lu ? ", stack[stackTop - 2], stack[stackTop - 1]);
-    stack[stackTop - 2] = (stack[stackTop - 2] == stack[stackTop - 1]);
+    stack[stackTop - 2] = (unsigned long) (stack[stackTop - 2] == stack[stackTop - 1]);
 //    printf("Result: %lu\n", stack[stackTop - 2]);
     stackTop--;
 }
 
 void run_and_filter() {
-    stack[stackTop - 2] = (stack[stackTop - 2] && stack[stackTop - 1]);
+    stack[stackTop - 2] = (unsigned long) (stack[stackTop - 2] && stack[stackTop - 1]);
     stackTop--;
 }
 
 void run_or_filter() {
-    stack[stackTop - 2] = (stack[stackTop - 2] || stack[stackTop - 1]);
+    stack[stackTop - 2] = (unsigned long) (stack[stackTop - 2] || stack[stackTop - 1]);
     stackTop--;
 }
 
 void run_ip_filter() {
-    stack[stackTop++] = current_ether_hdr != NULL && current_ether_hdr->ether_type == htons(ETH_P_IP);
+    stack[stackTop++] = (unsigned long) (current_ether_hdr != NULL &&
+                                         current_ether_hdr->ether_type == htons(ETH_P_IP));
 }
 
 void run_arp_filter() {
-    stack[stackTop++] = current_ether_hdr != NULL && current_ether_hdr->ether_type == htons(ETH_P_ARP);
+    stack[stackTop++] = (unsigned long) (current_ether_hdr != NULL &&
+                                         current_ether_hdr->ether_type == htons(ETH_P_ARP));
 }
 
 void run_icmp_filter() {
-    stack[stackTop++] = current_ip_hdr != NULL && current_ip_hdr->ip_proto == htons(IPPROTO_ICMP);
+    ip_hdr *h = get_current_ip_hdr();
+    stack[stackTop++] = (unsigned long) (h != NULL && h->ip_proto == IPPROTO_ICMP);
 }
 
-void run_tcp_filter() { stack[stackTop++] = current_ip_hdr != NULL && current_ip_hdr->ip_proto == htons(IPPROTO_TCP); }
+void run_tcp_filter() {
+    ip_hdr *h = get_current_ip_hdr();
 
-void run_udp_filter() { stack[stackTop++] = current_ip_hdr != NULL && current_ip_hdr->ip_proto == htons(IPPROTO_UDP); }
+    stack[stackTop++] = (unsigned long) (h != NULL && h->ip_proto == IPPROTO_TCP);
+}
+
+void run_udp_filter() {
+    ip_hdr *h = get_current_ip_hdr();
+
+    stack[stackTop++] = (unsigned long) (h != NULL && h->ip_proto == IPPROTO_UDP);
+}
 
 
 /*******************
@@ -198,23 +384,33 @@ void run_udp_filter() { stack[stackTop++] = current_ip_hdr != NULL && current_ip
  *******************/
 
 unsigned char *parse_ether_addr(char *filter) {
+    // 6 bytes used by an Ethernet Address
     unsigned char *ether = malloc(sizeof(unsigned char) * 6);
+
+    // Copy string to use in strtok
     char *copy = malloc(sizeof(char) * (strlen(filter) + 1));
     strcpy(copy, filter);
 
-
+    // Parse text value to byte
     ether[0] = (unsigned char) strtol(strtok(copy, ":"), NULL, 16);
     for (int j = 1; j < 6; ++j) {
         ether[j] = (unsigned char) strtol(strtok(NULL, ":"), NULL, 16);
     }
 
-
     return (unsigned char *) ether;
 }
 
-int *parse_ip_addr(char *filter) {
+int parse_ip_addr(char *filter) {
+    // Resulting int IP
+    int result = 0;
+
+    // Parsed IP segments
     int *ipp = malloc(sizeof(int) * 4);
+
+    // 4 IP address segments
     char **ip = malloc(sizeof(char *) * 4);
+
+    // Copy string to use in strtok
     char *copy = malloc(sizeof(char) * (strlen(filter) + 1));
     strcpy(copy, filter);
 
@@ -226,11 +422,15 @@ int *parse_ip_addr(char *filter) {
 
     // Parse to int
     for (int i = 0; i < 4; ++i) {
-        ipp[i] = atoi(ip[i]);
+        ipp[i] = (int) strtol(ip[i], NULL, 10);
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        result += ipp[i] << ((3 - i) * 8);
     }
 
     // Return IP number array
-    return ipp;
+    return result;
 }
 
 unsigned long parse_decimal(char *filter) {
@@ -259,14 +459,8 @@ void push_ether_addr(unsigned char ether[6]) {
     stack[stackTop++] = i & 0xFFFFFFFFFFFF;
 }
 
-void push_ip_addr(unsigned int ip[4]) {
-    unsigned long res = 0;
-
-    for (int i = 0; i < 4; ++i) {
-        res += (ip[i]) << 8 * (3 - i);
-    }
-
-    stack[stackTop++] = res & 0xFFFFFFFF;
+void push_ip_addr(const unsigned int ip) {
+    stack[stackTop++] = ip & 0xFFFFFFFF;
 }
 
 void push_hex(unsigned int number) {
@@ -278,20 +472,30 @@ void push_decimal(unsigned int number) {
 }
 
 void push_ipproto() {
-    stack[stackTop++] = current_ip_hdr->ip_proto;
+    ip_hdr *h = get_current_ip_hdr();
+
+    if(h == NULL) {
+        stack[stackTop++] = 0;
+    } else{
+        stack[stackTop++] = h->ip_proto;
+    }
 }
 
 void push_ipfrom() {
-    if (current_ip_hdr) {
-        push_ip_addr(current_ip_hdr->ip_src);
+    ip_hdr *h = get_current_ip_hdr();
+
+    if (h != NULL) {
+        push_ip_addr(ntohl(h->ip_src));
     } else {
         stack[stackTop++] = 0;
     }
 }
 
 void push_ipto() {
-    if (current_ip_hdr) {
-        push_ip_addr(current_ip_hdr->ip_dst);
+    ip_hdr *h = get_current_ip_hdr();
+
+    if (h != NULL) {
+        push_ip_addr(ntohl(h->ip_dst));
     } else {
         stack[stackTop++] = 0;
     }
@@ -301,68 +505,65 @@ void push_ethertype() {
     stack[stackTop++] = current_ether_hdr->ether_type;
 }
 
-char *extract_data_from_hdr(ip_hdr *hdr) {
-    unsigned int udp_data_len = current_ip_hdr->ip_len - sizeof(ip_hdr);
-    char *udp_data = malloc(sizeof(char) * (udp_data_len));
-    memcpy(udp_data + sizeof(ip_hdr), current_ip_hdr, udp_data_len);
-
-    return udp_data;
-}
-
 void push_udptoport() {
-    if (current_ip_hdr == NULL || current_ip_hdr->ip_proto != IPPROTO_UDP) {
+    udp_hdr *h = get_current_udp_hdr();
+
+    if (h != NULL) {
+        stack[stackTop++] = h->dst_port;
+    } else {
         stack[stackTop++] = 0;
         return;
     }
-
-    udp_hdr *udp_data = (udp_hdr *) extract_data_from_hdr(current_ip_hdr);
-    stack[stackTop++] = udp_data->dst_port;
-
 }
 
 void push_udpfromport() {
-    if (current_ip_hdr == NULL || current_ip_hdr->ip_proto != IPPROTO_UDP) {
+    udp_hdr *h = get_current_udp_hdr();
+
+    if (h != NULL) {
+        stack[stackTop++] = h->src_port;
+    } else {
         stack[stackTop++] = 0;
         return;
     }
-
-    udp_hdr *udp_data = (udp_hdr *) extract_data_from_hdr(current_ip_hdr);
-    stack[stackTop++] = udp_data->src_port;
 }
 
 void push_tcptoport() {
-    if (current_ip_hdr == NULL || current_ip_hdr->ip_proto != IPPROTO_TCP) {
+    tcp_hdr *h = get_current_tcp_hdr();
+
+    if (h != NULL) {
+        stack[stackTop++] = h->dst_port;
+    } else {
         stack[stackTop++] = 0;
         return;
     }
-
-    tcp_hdr *tcp_data = (tcp_hdr *) extract_data_from_hdr(current_ip_hdr);
-    stack[stackTop++] = tcp_data->dst_port;
 }
 
 void push_tcpfromport() {
-    if (current_ip_hdr == NULL || current_ip_hdr->ip_proto != IPPROTO_TCP) {
+    tcp_hdr *h = get_current_tcp_hdr();
+
+    if (h != NULL) {
+        stack[stackTop++] = h->src_port;
+    } else {
         stack[stackTop++] = 0;
         return;
     }
-
-    tcp_hdr *tcp_data = (tcp_hdr *) extract_data_from_hdr(current_ip_hdr);
-    stack[stackTop++] = tcp_data->src_port;
 }
 
 void push_icmptype() {
-    if (current_ip_hdr == NULL || current_ip_hdr->ip_proto != IPPROTO_ICMP) {
+    icmp_hdr *h = get_current_icmp_hdr();
+
+    if (h != NULL) {
+        stack[stackTop++] = h->type;
+    } else {
         stack[stackTop++] = 0;
         return;
     }
-
-    icmp_hdr *icmp_data = (icmp_hdr *) extract_data_from_hdr(current_ip_hdr);
-    stack[stackTop++] = icmp_data->type;
 }
 
 /**********************
  * CHECKING FUNCTIONS *
  **********************/
+
 
 bool is_decimal(char *c) {
     int index = 0;
@@ -437,16 +638,9 @@ bool is_ether_addr(char *c) {
  *  FILTER SETUP FUNCTIONS *
  ***************************/
 
-void set_ether_header(ether_hdr *ether_hdr) {
+void set_ether_header(ether_hdr *ether_hdr, long len) {
     current_ether_hdr = ether_hdr;
-}
-
-void set_ip_header(ip_hdr *ip_hdr) {
-    current_ip_hdr = ip_hdr;
-}
-
-void set_arp_header(arp_hdr *arp_hdr) {
-    current_arp_hdr = arp_hdr;
+    current_ether_hdr_len = len;
 }
 
 // Print the expected command line for the program
@@ -519,6 +713,9 @@ void process_parameters(int argc, char **argv) {
 
 void reset_stack() {
     stackTop = 0;
+    current_network_data = NULL;
+    current_transport_data = NULL;
+
     for (int i = 0; i < MAX_FILTER_STACK; ++i) {
         stack[i] = 0;
     }
@@ -620,7 +817,7 @@ bool is_filtered() {
 }
 
 char *ether_addr_to_string(unsigned char *addr) {
-    char *str = malloc(sizeof(char) * 17);
+    char *str = malloc(sizeof(char) * 18); // 17 characters + null-terminator
 
     // TODO: check ntohs
     sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -636,13 +833,13 @@ char *ether_addr_to_string(unsigned char *addr) {
 }
 
 char *ip_addr_to_string(unsigned int ip) {
-    int parts[4];
-    int mask = 0xFF;
+    short parts[4];
+    unsigned int mask = 0xFF;
     for (int i = 0; i < 4; ++i) {
-        parts[i] = ip & (mask << (3 - i));
+        parts[3 - i] = (unsigned short) ((ip >> i * 8) & mask);
     }
 
-    char* str_ip = malloc(sizeof(char) * 15);
+    char *str_ip = malloc(sizeof(char) * 16); // 3*4 numbers + 3 dots + 1 \0
 
     sprintf(str_ip, "%000d.%000d.%000d.%000d", parts[0], parts[1], parts[2], parts[3]);
 
@@ -664,68 +861,103 @@ char *get_ether_type_name(unsigned int type) {
     }
 }
 
+char *get_proto_name(int proto) {
+    struct protoent *a = getprotobynumber(proto);
+    if(a != NULL) {
+        return a->p_name;
+    } else {
+        return "?";
+    }
+}
+
 char *get_make_from_ether_addr(unsigned int *addr) {
     return "Intel";
+}
+
+bool eth_is_broadcast(ether_hdr *eth) {
+    for (int i = 0; i < 6; ++i) {
+        if(eth->ether_dhost[i] != 0xFF) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void print_ip_hdr(ip_hdr *hdr, int data_size) {
+
+    printf("IP: ----- IP Header -----\n"
+           "IP:\n"
+           "IP: Version             = %d\n"
+           "IP: Header length       = %d bytes\n"
+           "IP: Type of service     = %d\n"
+           "IP: ..0. .... routine\n"
+           "IP: ...0 .... normal delay\n"
+           "IP: .... 0... normal throughput\n"
+           "IP: .... .0.. normal reliability\n"
+           "IP: Total length        = %d bytes\n"
+           "IP: Identification      = %d\n"
+           "IP: Flags               = %01x\n"
+           "IP: .%d.. .... may fragment\n"
+           "IP: ..%d. .... more fragments\n"
+           "IP: Fragment offset     = %d bytes\n"
+           "IP: Time to live        = %d seconds/hops\n"
+           "IP: Protocol            = %d (%s)\n"
+           "IP: Header checksum     = %X\n"
+           "IP: Source address      = %s,\n"
+           "IP: Destination address = %s,\n"
+           "IP:\n",
+           hdr->ip_v,
+           ntohs(hdr->ip_len),
+           hdr->ip_tos,
+           data_size - (int) sizeof(ip_hdr),
+           ntohs(hdr->ip_id),
+           hdr->ip_flags & 0x4,
+           (hdr->ip_flags & 0x1) == (0x1),
+           (hdr->ip_flags & 0x2) == (0x2),
+           ntohs(hdr->ip_offset),
+           hdr->ip_ttl,
+           hdr->ip_proto, get_proto_name(hdr->ip_proto),
+           ntohs(hdr->ip_csum),
+           ip_addr_to_string(ntohl(hdr->ip_src)),
+           ip_addr_to_string(ntohl(hdr->ip_dst))
+    );
 }
 
 void print_ether_hdr(ether_hdr *hdr, int data_size) {
 
     int order = packet_count;
     int size = data_size;
-    int type_number = hdr->ether_type;
+    int type_number = ntohs(hdr->ether_type);
     char *type_name = get_ether_type_name(ntohs(hdr->ether_type));
     char *dst_addr = ether_addr_to_string(hdr->ether_dhost);
     char *src_addr = ether_addr_to_string(hdr->ether_shost);
     char *make = get_make_from_ether_addr(hdr->ether_shost);
+    char  *broadcast = (eth_is_broadcast(hdr)) ? ", (broadcast)" : "";
 
     printf("ETHER:  ----- Ethernet Header -----\n"
            "ETHER:\n"
            "ETHER:  Packet %d\n"
            "ETHER:  Packet size = %d bytes\n"
-           "ETHER:  Destination = %s, (broadcast)\n"
+           "ETHER:  Destination = %s%s\n"
            "ETHER:  Source      = %s, %s\n"
-           "ETHER:  Ethertype = %x (%s)\n"
+           "ETHER:  Ethertype   = %x (%s)\n"
            "ETHER:\n",
             /* Packet      */ order,
             /* Packet size */ size,
-            /* Destination */ dst_addr,
+            /* Destination */ dst_addr, broadcast,
             /* Source      */ src_addr, make,
             /* Ethertype   */ type_number, type_name
     );
 
-    // check if data is ip
+    if(get_current_ip_hdr() != NULL) {
+        print_ip_hdr(get_current_ip_hdr(), current_ether_hdr_len - sizeof(ether_hdr));
+    }
 }
 
-void print_ip_hdr(ip_hdr *hdr, int data_size) {
-    printf("IP: ----- IP Header -----\n"
-    "IP:\n"
-    "IP: Version = 4, header length = %d bytes\n"
-    "IP: Type of service = xx\n"
-    "IP: ..0. .... = routine\n"
-    "IP: ...0 .... = normal delay\n"
-    "IP: .... 0... = normal throughput\n"
-    "IP: .... .0.. = normal reliability\n"
-    "IP: Total length = xxx bytes\n"
-    "IP: Identification x\n"
-    "IP: Flags = 0X\n"
-    "IP: .0.. .... = may fragment\n"
-    "IP: ..0. .... = more fragments\n"
-    "IP: Fragment offset = 0 bytes\n"
-    "IP: Time to live = xxx seconds/hops\n"
-    "IP: Protocol = xx (XXX)\n"
-    "IP: Header checksum = xxxx\n"
-    "IP: Source address = %s,\n"
-    "IP: Destination address = %s,\n"
-    "IP:\n"
-    ,
-    data_size,
-    ip_addr_to_string(hdr->ip_src),
-    ip_addr_to_string(hdr->ip_dst)
-    );
-}
 
 // Break this function to implement the functionalities of your packet analyser
-void process(unsigned char *packet, int len) {
+void process(unsigned char *packet, long len) {
     // Check if frame is valid
     if (len == 0)
         return;
@@ -733,40 +965,56 @@ void process(unsigned char *packet, int len) {
     // Cast packet data to Ethernet Header struct
     ether_hdr *eth = (ether_hdr *) packet;
 
-    // Allocate and copy data from Ethernet header
-    unsigned char *data = malloc(sizeof(unsigned char) * (len - sizeof(ether_hdr)));
-    memcpy(data, packet + sizeof(ether_hdr), sizeof(unsigned char) * (len - sizeof(ether_hdr)));
+    // Extract header data
+    unsigned char *data = extract_data_from_hdr((unsigned char *) eth, sizeof(ether_hdr), len, 0);
 
     // Globally set current Ethernet header to be used to run filters
-    set_ether_header(eth);
+    set_ether_header(eth, len);
 
-    if (eth->ether_type == htons(0x0800)) {
-        ip_hdr *ip = (ip_hdr *) data;
-
-        set_arp_header(NULL);
-        set_ip_header(ip);
-    } else if (eth->ether_type == htons(0x0806)) {
-        arp_hdr *arp = (arp_hdr *) data;
-
-        set_arp_header(arp);
-        set_ip_header(NULL);
-    }
-
+    // Check if packet should be filtered
     if (!is_filtered()) {
+        accepted_packets++;
+        sequential_rejected_packets = 0;
+
+        printf("\r");
         print_ether_hdr(current_ether_hdr, len);
 
-        fflush(stdout);
+    } else {
+        printf("\rPackets rejected in a row: %d", ++sequential_rejected_packets);
     }
+
+    fflush(stdout);
+}
+
+void signal_handler(int signal) {
+    printf("\n"
+           "ethernet frames:       %d\n"
+           "ethernet broadcast:    %d\n"
+           "ARP                    %d\n"
+           "IP                     %d\n"
+           "ICMP                   %d\n"
+           "UDP                    %d\n"
+           "TCP                    %d\n"
+           "To this host:          %d\n",
+           0,0,0,0,0,0,0,0);
+
+    // Continue signal propagation
+    exit(signal);
+}
+
+void register_signal_handler() {
+    signal(SIGTERM, signal_handler);
 }
 
 int main(int argc, char **argv) {
-    int n;
+    long n;
     int sockfd;
     unsigned char *packet_buffer;
     stack = malloc(sizeof(long) * MAX_FILTER_STACK);
 
     // Read parameters and filters
     process_parameters(argc, argv);
+    register_signal_handler();
 
     // Building socket
     if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) < 0) {
@@ -794,7 +1042,6 @@ int main(int argc, char **argv) {
             perror("Reading packet");
             exit(errno);
         }
-        printf(".");
         process(packet_buffer, n);
     }
 

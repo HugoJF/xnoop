@@ -401,8 +401,12 @@ eth_hdr *get_current_eth_hdr() {
 arp_hdr *get_current_arp_hdr() {
     eth_hdr *h = get_current_eth_hdr();
 
+    if(h == NULL) {
+        return NULL;
+    }
+
     // Check if current frame is ARP
-    if (eth_hdr_data_is_arp((eth_hdr *) h)) {
+    if ( eth_hdr_data_is_arp((eth_hdr *) h)) {
         return ((arp_hdr *) extract_data_from_eth_hdr((unsigned char *) h, current_eth_hdr_len));
     } else {
         return NULL;
@@ -416,6 +420,10 @@ arp_hdr *get_current_arp_hdr() {
  */
 ip_hdr *get_current_ip_hdr() {
     eth_hdr *h = get_current_eth_hdr();
+
+    if(h == NULL) {
+        return NULL;
+    }
 
     // If Ethernet header is not IP ignore
     if (!eth_hdr_data_is_ip(h)) {
@@ -440,6 +448,10 @@ ip_hdr *get_current_ip_hdr() {
 tcp_hdr *get_current_tcp_hdr() {
     ip_hdr *h = get_current_ip_hdr();
 
+    if(h == NULL) {
+        return NULL;
+    }
+
     // If Ethernet header is not ARP ignore
     if (!ip_hdr_data_is_tcp(h)) {
         return NULL;
@@ -462,6 +474,10 @@ tcp_hdr *get_current_tcp_hdr() {
 udp_hdr *get_current_udp_hdr() {
     ip_hdr *h = get_current_ip_hdr();
 
+    if(h == NULL) {
+        return NULL;
+    }
+
     // If Ethernet header is not ARP ignore
     if (!ip_hdr_data_is_udp(h)) {
         return NULL;
@@ -482,6 +498,10 @@ udp_hdr *get_current_udp_hdr() {
  */
 icmp_hdr *get_current_icmp_hdr() {
     ip_hdr *h = get_current_ip_hdr();
+
+    if(h == NULL) {
+        return NULL;
+    }
 
     // If Ethernet header is not ARP ignore
     if (!ip_hdr_data_is_icmp(h)) {
@@ -600,7 +620,12 @@ void run_arp_filter() {
  */
 void run_icmp_filter() {
     ip_hdr *h = get_current_ip_hdr();
-    stack[stackTop++] = (unsigned long) (h != NULL && h->proto == IPPROTO_ICMP);
+
+    if(h != NULL) {
+        stack[stackTop++] = (unsigned long) (h != NULL && h->proto == IPPROTO_ICMP);
+    } else {
+        stack[stackTop++] = 0;
+    }
 }
 
 /**
@@ -609,7 +634,11 @@ void run_icmp_filter() {
 void run_tcp_filter() {
     ip_hdr *h = get_current_ip_hdr();
 
-    stack[stackTop++] = (unsigned long) (h != NULL && h->proto == IPPROTO_TCP);
+    if(h != NULL) {
+        stack[stackTop++] = (unsigned long) (h != NULL && h->proto == IPPROTO_TCP);
+    } else {
+        stack[stackTop++] = 0;
+    }
 }
 
 /**
@@ -618,7 +647,11 @@ void run_tcp_filter() {
 void run_udp_filter() {
     ip_hdr *h = get_current_ip_hdr();
 
-    stack[stackTop++] = (unsigned long) (h != NULL && h->proto == IPPROTO_UDP);
+    if(h != NULL) {
+        stack[stackTop++] = (unsigned long) (h != NULL && h->proto == IPPROTO_UDP);
+    } else {
+        stack[stackTop++] = 0;
+    }
 }
 
 
@@ -1763,39 +1796,14 @@ int main(int argc, char **argv) {
     process_parameters(argc, argv);
     register_signal_handler();
 
-    // Build socket
-    if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) < 0) {
-        perror("Building socket");
-        exit(errno);
+    if(is_filtered()) {
+        printf("Filter returned: FILTERED\n");
+    } else {
+        printf("Filter returned: NOT FILTERED\n");
     }
 
-    // Bind socket to interface by name
-    if (bind_iface_name(sockfd, argv[2]) < 0) {
-        perror("Binding socket");
-        exit(errno);
-    }
-
-    // Allocate packet buffer
-    packet_buffer = malloc(MAX_PACKET_SIZE);
-    if (!packet_buffer) {
-        printf("Could not allocate a packet buffer\n");
-        exit(1);
-    }
-
-    // Read `max_packets` packets
-    while (packet_count++ < max_packets) {
-
-        if ((n = recv(sockfd, packet_buffer, MAX_PACKET_SIZE, 0)) < 0) {
-            perror("Reading packet");
-            exit(errno);
-        }
-        process(packet_buffer, n);
-    }
-
-    // Free packet and close socket
-    free(packet_buffer);
-    close(sockfd);
     printf("Ended\n");
 
     return 0;
 }
+

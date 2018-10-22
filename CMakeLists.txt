@@ -3,4 +3,4 @@ project(xnoop C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(xnoop main.c)
+add_executable(xnoop calc.c)
